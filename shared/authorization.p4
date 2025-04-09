@@ -5,7 +5,6 @@
 // NOTE: new type added here
 const bit<16> TYPE_IPV4 = 0x0800;
 const bit<16> TYPE_IPV6 = 0x86DD;
-const bit<16> TYPE_EPIC = 0x9010;
 
 /*************************************************************************
 *********************** H E A D E R S  ***********************************
@@ -19,23 +18,6 @@ header ethernet_t {
     bit<48> srcAddr;
     bit<16> etherType;
 }
-
-// EPIC Header
-header epic_l1 {
-    bit<4> path_ts;
-    bit<8> src_as_host;
-    bit<3> hop_validation;
-    bit<2> segment_id; // Similar to seg_id to hop_validation
-    bit<8> packet_ts;
-    bit<16> dest_validation;
-}
-
-// TODO: Make sure this works (idea on how to have many of these.)
-header epic_hop_validation {
-    bit<3> hop_validation;
-    bit<1> validation_next_hop;
-}
-// Add this to the parser/deparser
 
 // Layer 3 headers
 header ipv4_t {
@@ -64,9 +46,33 @@ header ipv6_t {
     bit<128> dstAddr;
 }
 
+header ipv6_ext_base_t {
+    bit<8> nextHeader;
+    bit<8> hdrExtLen;
+}
+
+// EPIC Header
+header epicl1_t {
+    bit<4> path_ts;
+    bit<8> src_as_host;
+    bit<4> hop_validation_count;    // Follow IPv6 extensions header 
+    bit<4> segment_id_count;        // ^^
+    bit<8> packet_ts;
+    bit<16> dest_validation;
+}
+
+header epic_hopValidation_t {
+    bit<3> hop_validation;
+}
+
+header epic_segId_t {
+    bit<2> segment_id;
+}
+
 // Metadata
 struct metadata {
-    bit<1> consensus;
+    bit<8> hopVal_index;
+    bit<8> segId_index;
 }
 
 // Headers
@@ -77,15 +83,16 @@ struct headers {
     // Layer 3 headers
     ipv4_t ipv4;
     ipv6_t ipv6;
+    ipv6_ext_base_t ipv6_ext;
 
-    epic_l1 epic;
+    epicl1_t epic;
+    epic_hopValidation_t epic_hopVal;
+    epic_segId_t epic_segId;
 }
 
 /*************************************************************************/
 /**************************  P A R S E R  ********************************/
 /*************************************************************************/
-
-// TODO: Added the consensus parsing function in MyParser
 parser MyParser(packet_in packet,
                 out headers hdr,
                 inout metadata meta,
@@ -107,9 +114,7 @@ parser MyParser(packet_in packet,
     state parse_ipv4{
         packet.extract(hdr.ipv4);
         transition select(hdr.ipv4.protocol){
-            TYPE_CONSENSUS: parse_consensus;
-            TYPE_TCP: parse_tcp;
-            TYPE_UDP: parse_udp;
+            TYPE_EPIC: parse_epic;
             default: accept;
         }
     }
@@ -117,30 +122,47 @@ parser MyParser(packet_in packet,
     state parse_ipv6{
         packet.extract(hdr.ipv6);
         transition select(hdr.ipv6.nextHeader){
-            TYPE_CONSENSUS: parse_consensus;
-            TYPE_TCP: parse_tcp;
-            TYPE_UDP: parse_udp;
-            default: accept;
+            TYPE_EPIC: parse_epic;
+            default: parse_ipv6_ext_chain;
         }
     }
 
-    state parse_consensus {
-        packet.extract(hdr.consensus);
-        transition select(hdr.consensus.protocol){
-            TYPE_TCP : parse_tcp;
-            TYPE_UDP : parse_udp;
-            default: accept;
+    state parse_ipv6_ext_chain {
+        packet.extract(hdr.ext_base);
+
+        // Calculate length to skip (8 * (hdrExtLen + 1))
+        bit<8> len = (hdr.ext_base.hdrExtLen + 1) * 8;
+        packet.advance(len - 2); // already extracted 2 bytes
+
+        transition select(hdr.ext_base.nextHeader) {
+            EPIC_NEXT_HEADER: parse_epic;
+            default: parse_ipv6_ext_chain;
+            // TODO
+            // SOLVE THIS CAUSE AT THE MOMENT IS AN INFINITE CHAIN
         }
     }
 
-    state parse_tcp {
-        packet.extract(hdr.tcp);
-        transition accept;
+    state parse_epic {
+        packet.extract(hdr.epic);
+        transition parse_epic_hopVal;
     }
 
-    state parse_udp {
-        packet.extract(hdr.udp);
-        transition accept;
+    state parse_epic_hopVal {
+        meta.hopVal_index = meta.hopVal_index + 1;
+        packet.extract(hdr.epic_hopVal);
+        transition select(meta.hopVal_index < hdr.epic.hop_validation_count){
+            true: parse_epic_hopVal;
+            false: parse_epic_segId;
+        }
+    }
+
+    state parse_epic_segId {
+        meta.segId_index = meta.segId_index + 1;
+        packet.extract(hdr.epic_segId);
+        transition select(meta.segId_index < hdr.epic.hop_validation_count){
+            true: parse_epic_segId;
+            false: accept;
+        }
     }
 }
 
@@ -163,27 +185,6 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         mark_to_drop(standard_metadata);
     }
 
-    //******************* Consensus Actions ************************//
-    action consent(){
-        hdr.consensus.allow = hdr.consensus.allow + 1;
-    }
-
-    action unconsent(){
-        hdr.consensus.allow = hdr.consensus.allow - 1;
-    }
-
-    action ipv4_ingress(){
-        hdr.consensus.setValid();
-        hdr.consensus.protocol = hdr.ipv4.protocol;
-        hdr.ipv4.protocol = TYPE_CONSENSUS;
-    }
-
-    action ipv6_ingress(){
-        hdr.consensus.setValid();
-        hdr.consensus.protocol = hdr.ipv6.nextHeader;
-        hdr.ipv6.nextHeader = TYPE_CONSENSUS;
-    }
-
     //******************** IP based forwarding ***************************//
     action ipv4_forward(bit<9> port) {
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
@@ -198,10 +199,6 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
     action ipv4_lastHop(bit<9> port){
         // If meta.consensus is not positive, the packet must be dropped
         meta.consensus = (hdr.consensus.allow > 0) ? 1w1 : 1w0;
-
-        // Removing consensus header and forwarding packet
-        hdr.ipv4.protocol = hdr.consensus.protocol;
-        hdr.consensus.setInvalid();
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
         standard_metadata.egress_spec = port;
     }
@@ -209,10 +206,6 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
     action ipv6_lastHop(bit<9> port){
         // If meta.consensus is not positive, the packet must be dropped
         meta.consensus = (hdr.consensus.allow > 0) ? 1w1 : 1w0;
-
-        // Removing consensus header and forwarding packet
-        hdr.ipv6.nextHeader = hdr.consensus.protocol;
-        hdr.consensus.setInvalid();
         hdr.ipv6.hoplim = hdr.ipv6.hoplim - 1;
         standard_metadata.egress_spec = port;
     }
@@ -248,111 +241,7 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         default_action = drop();
     }
 
-    //******************** Consensus tables definitions ***************************//
-
-#ifdef L2_SWITCH
-    // Layer 2 consensus table
-    table ethernet_consensus {
-        key = {
-            hdr.ethernet.srcAddr : exact;
-            hdr.ethernet.dstAddr : exact;
-            hdr.ethernet.etherType : exact;
-        }
-
-        actions = {
-            consent;
-            unconsent;
-        }
-
-        size = 1024;
-        default_action = unconsent();
-    }
-#endif
-
-#ifdef L3_SWITCH
-    // Layer 3 consensus tables
-    table ipv4_consensus {
-        key = {
-            hdr.ipv4.srcAddr: exact;
-        }
-
-        actions = {
-            consent;
-            unconsent;
-        }
-
-        size = 1024;
-        default_action = unconsent();
-    }
-
-    table ipv6_consensus {
-        key = {
-            hdr.ipv6.srcAddr: exact;
-        }
-
-        actions = {
-            consent;
-            unconsent;
-        }
-
-        size = 1024;
-        default_action = unconsent();
-    }
-#endif
-
-#ifdef L4_SWITCH
-    // Layer 4 consensus tables
-    table udp_consensus {
-        key = {
-            hdr.udp.dstPort : exact;
-        }
-
-        actions = {
-            consent;
-            unconsent;
-        }
-
-        size = 1024;
-        default_action = unconsent();
-    }
-
-    table tcp_consensus {
-        key = {
-            hdr.tcp.dstPort : exact;
-        }
-
-        actions = {
-            consent;
-            unconsent;
-        }
-
-        size = 1024;
-        default_action = unconsent();
-    }
-#endif
-
     apply {
-        // Add the consensus header if it doesn't exists
-        if(!hdr.consensus.isValid()){
-            if(hdr.ipv4.isValid()) ipv4_ingress();
-            else ipv6_ingress();
-        }
-
-        // Consensus tables
-#ifdef L2_SWITCH
-        if(hdr.ethernet.isValid()) ethernet_consensus.apply();
-#endif
-
-#ifdef L3_SWITCH
-        if(hdr.ipv4.isValid()) ipv4_consensus.apply();
-        else if(hdr.ipv6.isValid()) ipv6_consensus.apply();
-#endif
-
-#ifdef L4_SWITCH
-        if(hdr.tcp.isValid()) tcp_consensus.apply();
-        else if(hdr.udp.isValid()) udp_consensus.apply();
-#endif
-
         // Packet forwarding
         if(hdr.ipv4.isValid()) ipv4_forwarding.apply();
         else if(hdr.ipv6.isValid()) ipv6_forwarding.apply();
@@ -362,12 +251,11 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
 /*************************************************************************/
 /****************  E G R E S S   P R O C E S S I N G   *******************/
 /*************************************************************************/
-
 control MyEgress(inout headers hdr,
                  inout metadata meta,
                  inout standard_metadata_t standard_metadata) {
     apply {
-        if(!hdr.consensus.isValid() && meta.consensus == 0){
+        if(!hdr.consensus.isValid()){
             // Drop packet
             mark_to_drop(standard_metadata);
         }
@@ -377,7 +265,6 @@ control MyEgress(inout headers hdr,
 /*************************************************************************/
 /*************   C H E C K S U M    C O M P U T A T I O N   **************/
 /*************************************************************************/
-
 control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
      apply {
         update_checksum(
@@ -401,16 +288,12 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
 /*************************************************************************/
 /***********************  D E P A R S E R  *******************************/
 /*************************************************************************/
-
 control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         // Should automatically skip any non-valid headers
         packet.emit(hdr.ethernet);
         packet.emit(hdr.ipv4);
         packet.emit(hdr.ipv6);
-        packet.emit(hdr.consensus);
-        packet.emit(hdr.tcp);
-        packet.emit(hdr.udp);
     }
 }
 

@@ -69,26 +69,20 @@ header ipv6_ext_base_t {
 header epicl1_t {
     bit<4> path_ts;
     bit<8> src_as_host;
-    bit<4> hop_validation_count;    // Used to loop (with recursion) over the hop validations 
-    bit<4> segment_id_count;        // ^^
+    bit<4> per_hop_count;       // Used to loop (with recursion) over the hop validations 
     bit<8> packet_ts;
-    bit<8> nextHeader;              // Added nextHeader to the paper implementation
+    bit<8> nextHeader;          // Added nextHeader to the paper implementation
 
     // destination validation is unused in l1
 }
 
-header epic_hopValidation_t {
+header epicl1_per_hop_t {
     bit<3> hop_validation;
-}
-
-header epic_segId_t {
     bit<2> segment_id;
 }
 
 // Metadata
 struct metadata {
-    bit<8> hopVal_index;
-    bit<8> segId_index;
 }
 
 // Headers
@@ -102,8 +96,8 @@ struct headers {
     ipv6_ext_base_t ipv6_ext_base;
 
     epicl1_t epic;
-    epic_hopValidation_t epic_hopVal;
-    epic_segId_t epic_segId;
+    epicl1_per_hop_t epic_per_hop_1;
+    epicl1_per_hop_t epic_per_hop_2;
 }
 
 /*************************************************************************/
@@ -175,26 +169,20 @@ parser MyParser(packet_in packet,
 
     state parse_epic {
         packet.extract(hdr.epic);
-        transition parse_epic_hopVal;
+        transition parse_first_epic_hop;
     }
 
-    state parse_epic_hopVal {
-        meta.hopVal_index = meta.hopVal_index + 1;
-        packet.extract(hdr.epic_hopVal);
-        transition select(meta.hopVal_index < hdr.epic.hop_validation_count){
-            true: parse_epic_hopVal;
-            false: parse_epic_segId;
-        }
-    }
-
-    state parse_epic_segId {
-        meta.segId_index = meta.segId_index + 1;
-        packet.extract(hdr.epic_segId);
-
-        transition select(meta.segId_index < hdr.epic.hop_validation_count){
-            true: parse_epic_segId;
+    state parse_first_epic_hop {
+        packet.extract(hdr.epic_per_hop_1);
+        transition select(hdr.epic.per_hop_count > 1){
+            true: parse_second_epic_hop;
             false: accept;
         }
+    }
+
+    state parse_second_epic_hop {
+        packet.extract(hdr.epic_per_hop_2);
+        transition accept;
     }
 }
 
@@ -260,20 +248,45 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
     }
 
     // EPIC tables
-    table epic
+    table epic {
         key = {
-
+            hdr.epic.src_as_host: exact;
+            hdr.epic.packet_ts: exact;
+            hdr.epic_per_hop_1.hop_validation: exact;
+            hdr.epic.epic_per_hop_1.segment_id: exact;
         }
 
         actions = {
-            
+            drop;
         }
+
+        default_action = drop();
+    }
+
+    // EPIC function idea, still to implement
+    action epic_hop() {
+        hdr.epic.per_hop_count = hdr.epic.per_hop_count - 1;
+    }
+
+    action epic_later_header() {
+        hdr.ipv6_ext_base.nextHeader = hdr.epic.nextHeader;
+        hdr.epic.setInvalid();
+        hdr.epic_per_hop_1.setInvalid();
+    }
+
+    action epic_first_header() {
+        hdr.ipv6.nextHeader = hdr.epic.nextHeader;
+        hdr.epic.setInvalid();
+        hdr.epic_per_hop_1.setInvalid();
     }
 
     apply {
         // Packet forwarding
-        if(hdr.ipv4.isValid()) ipv4_forwarding.apply();
+        if(hdr.ipv4.isValid()) ipv4_forwarding.apply(); // Should probably be removed
         else if(hdr.ipv6.isValid()) ipv6_forwarding.apply();
+
+        if(hdr.epic.per_hop_count == 1 && hdr.ipv6_ext_base.isValid()) epic_later_header();
+        else if(hdr.epic.per_hop_count == 1) epic_first_header();
     }
 }
 
@@ -318,10 +331,15 @@ control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         // Should automatically skip any non-valid headers
         packet.emit(hdr.ethernet);
-        packet.emit(hdr.ipv4);
+        packet.emit(hdr.ipv4); // Probably should be removed
         packet.emit(hdr.ipv6);
 
         // TODO
+        packet.emit(hdr.ipv6_ext_base); // How many times should I emit this? How can I handle multiple?
+
+        packet.emit(epic);
+        // epic_per_hop_1 shoduln't be emitted since it's valid only for this border router
+        packet.emit(epic_per_hop_2);
     }
 }
 

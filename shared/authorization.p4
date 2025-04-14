@@ -72,13 +72,13 @@ header epicl1_t {
     bit<4> per_hop_count;       // Used to loop (with recursion) over the hop validations 
     bit<8> packet_ts;
     bit<8> nextHeader;          // Added nextHeader to the paper implementation
-
     // destination validation is unused in l1
 }
 
 header epicl1_per_hop_t {
     bit<3> hop_validation;
     bit<2> segment_id;
+    bit<3> padding;
 }
 
 // Metadata
@@ -91,7 +91,7 @@ struct headers {
     ethernet_t ethernet;
 
     // Layer 3 headers
-    // ipv4_t ipv4;
+    ipv4_t ipv4; // ---- 
     ipv6_t ipv6;
     ipv6_ext_base_t ipv6_ext_base;
 
@@ -134,7 +134,7 @@ parser MyParser(packet_in packet,
     state parse_ipv6{
         packet.extract(hdr.ipv6);
         transition select(hdr.ipv6.nextHeader){
-            TYPE_EPIC: parse_epic;
+            EPIC: parse_epic;
             default: parse_ipv6_ext_chain;
         }
     }
@@ -144,7 +144,7 @@ parser MyParser(packet_in packet,
 
         // Calculate length to skip (8 * (hdrExtLen + 1))
         bit<16> len = (bit<16>) (hdr.ipv6_ext_base.hdrExtLen + 1) * 8;
-        packet.advance(len - 2); // already extracted 2 bytes
+        packet.advance((bit<32>) (len - 2)); // already extracted 2 bytes
 
         transition select(hdr.ipv6_ext_base.nextHeader) {
 
@@ -216,53 +216,6 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         standard_metadata.egress_spec = port;
     }
 
-    /* --- Most likely will be unused
-    table ipv4_forwarding {
-        key = {
-            hdr.ipv4.dstAddr: lpm;
-        }
-
-        actions = {
-            ipv4_forward;
-            drop;
-        }
-
-        size = 1024;
-        default_action = drop();
-    }
-    */
-
-    // IPv6 table
-    table ipv6_forwarding {
-        key = {
-            hdr.ipv6.dstAddr: lpm;
-        }
-
-        actions = {
-            ipv6_forward;
-            drop;
-        }
-
-        size = 1024;
-        default_action = drop();
-    }
-
-    // EPIC tables
-    table epic {
-        key = {
-            hdr.epic.src_as_host: exact;
-            hdr.epic.packet_ts: exact;
-            hdr.epic_per_hop_1.hop_validation: exact;
-            hdr.epic.epic_per_hop_1.segment_id: exact;
-        }
-
-        actions = {
-            drop;
-        }
-
-        default_action = drop();
-    }
-
     // EPIC function idea, still to implement
     action epic_hop() {
         hdr.epic.per_hop_count = hdr.epic.per_hop_count - 1;
@@ -280,13 +233,81 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         hdr.epic_per_hop_1.setInvalid();
     }
 
+    // --- Most likely will be unused
+    table ipv4_forwarding {
+        key = {
+            hdr.ipv4.dstAddr: lpm;
+        }
+
+        actions = {
+            ipv4_forward;
+            drop;
+        }
+
+        size = 1024;
+        default_action = drop();
+    }
+    // ----------
+
+    // IPv6 table
+    table ipv6_forwarding {
+        key = {
+            hdr.ipv6.dstAddr: lpm;
+        }
+
+        actions = {
+            ipv6_forward;
+            drop;
+        }
+
+        size = 1024;
+        default_action = drop();
+    }
+
+    // EPIC tables
+    table epic_authorization {
+        key = {
+            hdr.epic.src_as_host: exact;
+            hdr.epic.packet_ts: exact;
+            hdr.epic_per_hop_1.hop_validation: exact;
+            hdr.epic_per_hop_1.segment_id: exact;
+        }
+
+        actions = {
+            NoAction;
+            drop;
+        }
+
+        size = 1024;
+        default_action = drop();
+    }
+
+    table epic_structure {
+        key = {
+            hdr.epic.per_hop_count: exact;
+            hdr.ipv6.nextHeader: exact;
+        }
+
+        actions = {
+            epic_hop;
+            epic_later_header;
+            epic_first_header;
+            drop;
+        }
+
+        size = 1024;
+        default_action = epic_hop();
+    }
+
     apply {
         // Packet forwarding
         if(hdr.ipv4.isValid()) ipv4_forwarding.apply(); // Should probably be removed
         else if(hdr.ipv6.isValid()) ipv6_forwarding.apply();
 
-        if(hdr.epic.per_hop_count == 1 && hdr.ipv6_ext_base.isValid()) epic_later_header();
-        else if(hdr.epic.per_hop_count == 1) epic_first_header();
+        if(hdr.epic.isValid()) {
+            epic_authorization.apply();
+            epic_structure.apply();
+        }
     }
 }
 
@@ -337,9 +358,9 @@ control MyDeparser(packet_out packet, in headers hdr) {
         // TODO
         packet.emit(hdr.ipv6_ext_base); // How many times should I emit this? How can I handle multiple?
 
-        packet.emit(epic);
+        packet.emit(hdr.epic);
         // epic_per_hop_1 shoduln't be emitted since it's valid only for this border router
-        packet.emit(epic_per_hop_2);
+        packet.emit(hdr.epic_per_hop_2);
     }
 }
 

@@ -67,18 +67,18 @@ header ipv6_ext_base_t {
 
 // EPIC Header
 header epicl1_t {
-    bit<4> path_ts;
-    bit<8> src_as_host;
-    bit<4> per_hop_count;       // Used to loop (with recursion) over the hop validations 
-    bit<8> packet_ts;
+    bit<32> path_ts;
+    bit<64> src_as_host;
+    bit<64> packet_ts;
+
+    bit<8> per_hop_count;       // Used to loop (with recursion) over the hop validations 
     bit<8> nextHeader;          // Added nextHeader to the paper implementation
     // destination validation is unused in l1
 }
 
 header epicl1_per_hop_t {
-    bit<3> hop_validation;
-    bit<2> segment_id;
-    bit<3> padding;
+    bit<24> hop_validation;
+    bit<16> segment_id;
 }
 
 // Metadata
@@ -233,6 +233,11 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         hdr.epic_per_hop_1.setInvalid();
     }
 
+    action check_hop_validation(){
+        // TODO:
+        // Calculate the MAC and check whether it is correct with the one provided in the header
+    }
+
     // --- Most likely will be unused
     table ipv4_forwarding {
         key = {
@@ -267,14 +272,11 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
     // EPIC tables
     table epic_authorization {
         key = {
-            hdr.epic.src_as_host: exact;
-            hdr.epic.packet_ts: exact;
-            hdr.epic_per_hop_1.hop_validation: exact;
-            hdr.epic_per_hop_1.segment_id: exact;
+            // TODO, based on extern function available
         }
 
         actions = {
-            NoAction;
+            check_hop_validation;
             drop;
         }
 

@@ -34,21 +34,6 @@ header ethernet_t {
 }
 
 // Layer 3 headers
-header ipv4_t {
-    bit<4> version;
-    bit<4> ihl;
-    bit<8> diffserv;
-    bit<16> totalLen;
-    bit<16> identification;
-    bit<3> flags;
-    bit<13> fragOffset;
-    bit<8> ttl;
-    bit<8> protocol;
-    bit<16> hdrChecksum;
-    bit<32> srcAddr;
-    bit<32> dstAddr;
-}
-
 header ipv6_t {
     bit<4> version;
     bit<8> traffClass;
@@ -115,21 +100,10 @@ parser MyParser(packet_in packet,
     state parse_ethernet {
         packet.extract(hdr.ethernet);
         transition select(hdr.ethernet.etherType){
-            // TYPE_IPV4: parse_ipv4; --> Un-needed
             TYPE_IPV6: parse_ipv6;
             default: accept;
         }
     }
-
-    /*
-    state parse_ipv4{
-        packet.extract(hdr.ipv4);
-        transition select(hdr.ipv4.protocol){
-            TYPE_EPIC: parse_epic;
-            default: accept;
-        }
-    }
-    */
 
     state parse_ipv6{
         packet.extract(hdr.ipv6);
@@ -206,11 +180,6 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
     }
 
     //******************** IP based forwarding ***************************//
-    action ipv4_forward(bit<9> port) {
-        hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
-        standard_metadata.egress_spec = port;
-    }
-
     action ipv6_forward(bit<9> port){
         hdr.ipv6.hoplim = hdr.ipv6.hoplim - 1;
         standard_metadata.egress_spec = port;
@@ -237,22 +206,6 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         // TODO:
         // Calculate the MAC and check whether it is correct with the one provided in the header
     }
-
-    // --- Most likely will be unused
-    table ipv4_forwarding {
-        key = {
-            hdr.ipv4.dstAddr: lpm;
-        }
-
-        actions = {
-            ipv4_forward;
-            drop;
-        }
-
-        size = 1024;
-        default_action = drop();
-    }
-    // ----------
 
     // IPv6 table
     table ipv6_forwarding {
@@ -303,8 +256,7 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
 
     apply {
         // Packet forwarding
-        if(hdr.ipv4.isValid()) ipv4_forwarding.apply(); // Should probably be removed
-        else if(hdr.ipv6.isValid()) ipv6_forwarding.apply();
+        if(hdr.ipv6.isValid()) ipv6_forwarding.apply();
 
         if(hdr.epic.isValid()) {
             epic_authorization.apply();
@@ -354,7 +306,6 @@ control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         // Should automatically skip any non-valid headers
         packet.emit(hdr.ethernet);
-        packet.emit(hdr.ipv4); // Probably should be removed
         packet.emit(hdr.ipv6);
 
         // TODO

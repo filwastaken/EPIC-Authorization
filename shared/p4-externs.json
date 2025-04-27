@@ -1,0 +1,19 @@
+{
+    "externs": [
+        {
+            "name": "hvf_mac",
+            "methods": [
+                {
+                    "name": "compute_hvf",
+                    "return_type": "bit<24>",
+                    "parameters": [
+                        {"name": "tspkt", "type": "bit<64>"},
+                        {"name": "src", "type": "bit<64>"},
+                        {"name": "hop_authenticator", "type": "bit<128>"}
+                    ]
+                }
+            ]
+        }
+    ]
+}
+  

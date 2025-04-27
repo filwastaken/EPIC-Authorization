@@ -2,6 +2,8 @@
 #include <core.p4>
 #include <v1model.p4>
 
+#include "hvf_extern.p4"
+
 // https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
 // Layer 2 definitions
 const bit<16> TYPE_IPV4 = 0x0800;

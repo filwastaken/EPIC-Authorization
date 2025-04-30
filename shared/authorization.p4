@@ -20,6 +20,11 @@ const bit<8> SHIM6 = 140;
 const bit<8> BIT_EMU = 147;
 const bit<8> EPIC = 253;
 
+#ifndef MAX_SRV6_SEGMENTS
+    // This allows to define the value during compiationa and change the default
+    #define MAX_SRV6_SEGMENTS 10
+#endif
+
 /*************************************************************************
 *********************** H E A D E R S  ***********************************
 *************************************************************************/
@@ -33,7 +38,7 @@ header ethernet_t {
     bit<16> etherType;
 }
 
-// Layer 3 headers
+// IPv6 header
 header ipv6_t {
     bit<4> version;
     bit<8> traffClass;
@@ -45,9 +50,23 @@ header ipv6_t {
     bit<128> dstAddr;
 }
 
+// IPv6 extension header structure
 header ipv6_ext_base_t {
     bit<8> nextHeader;
     bit<8> hdrExtLen;
+}
+
+// Routing extension header
+header route_base_t {
+    bit<8>  nextHeader;
+    bit<8>  headerLength;    // Length in 8-octet units, minus first 8 octets
+    bit<8>  routingType;
+    bit<8>  segmentsLeft; // Index (0..N-1) of the next segment to process
+    bit<32> reserved; // Unsure
+}
+
+header route_segment_list_entry_t {
+    bit<128> address;
 }
 
 // EPIC Header
@@ -75,11 +94,15 @@ struct headers {
     // Layer 2 headers
     ethernet_t ethernet;
 
-    // Layer 3 headers
-    ipv4_t ipv4; // ---- 
+    // IPv6 headers
     ipv6_t ipv6;
     ipv6_ext_base_t ipv6_ext_base;
 
+    // Route headers
+    route_base_t route_header;
+    route_segment_list_entry_t segment_list[MAX_SRV6_SEGMENTS];
+
+    // EPIC headers
     epicl1_t epic;
     epicl1_per_hop_t epic_per_hop_1;
     epicl1_per_hop_t epic_per_hop_2;
@@ -108,6 +131,17 @@ parser MyParser(packet_in packet,
     state parse_ipv6{
         packet.extract(hdr.ipv6);
         transition select(hdr.ipv6.nextHeader){
+            IPV6_ROUTE: parse_route;
+            EPIC: parse_epic;
+            default: parse_ipv6_ext_chain;
+        }
+    }
+
+    state parse_route {
+        packet.extract(hdr.route_header);
+        packet.extract(hdr.segment_list, (bit<32>) (hdr.route_header.headerLength / 2))
+
+        transition select(hdr.route_header.nextHeader){
             EPIC: parse_epic;
             default: parse_ipv6_ext_chain;
         }
@@ -185,6 +219,13 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         standard_metadata.egress_spec = port;
     }
 
+    //******************** Routing header forwarding ***************************//
+    action nextDestination() {
+        bit<8> index = MAX_SRV6_SEGMENTS - hdr.route_header.segmentsLeft;
+        hdr.ipv6.dstAddr = hdr.segment_list[index].address;
+        hdr.route_header.segmentsLeft = hdr.route_header.segmentsLeft - 1;
+    }
+
     // EPIC function idea, still to implement
     action epic_hop() {
         hdr.epic.per_hop_count = hdr.epic.per_hop_count - 1;
@@ -222,6 +263,20 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         default_action = drop();
     }
 
+    // Routing table
+    table routing_forwarding {
+        key = {
+            hdr.ipv6.dstAddr: exact;
+        }
+
+        actions = {
+            nextDestination;
+            NoAction;
+        }
+
+        default_action = NoAction();
+    }
+
     // EPIC tables
     table epic_authorization {
         key = {
@@ -256,7 +311,14 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
 
     apply {
         // Packet forwarding
-        if(hdr.ipv6.isValid()) ipv6_forwarding.apply();
+        if(hdr.ipv6.isValid()) {
+            if(hdr.route_header.isValid() && hdr.segment_list.isValid() && hdr.route_header.segmentsLeft > 0) {
+                routing_forwarding.apply()
+            }
+
+            ipv6_forwarding.apply();
+        }
+
 
         if(hdr.epic.isValid()) {
             epic_authorization.apply();
@@ -307,6 +369,10 @@ control MyDeparser(packet_out packet, in headers hdr) {
         // Should automatically skip any non-valid headers
         packet.emit(hdr.ethernet);
         packet.emit(hdr.ipv6);
+
+        // Route header
+        packet.emit(hdr.route_header);
+        packet.emit(hdr.segment_list);
 
         // TODO
         packet.emit(hdr.ipv6_ext_base); // How many times should I emit this? How can I handle multiple?

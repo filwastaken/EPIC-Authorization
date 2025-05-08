@@ -21,8 +21,11 @@ const bit<8> BIT_EMU = 147;
 const bit<8> EPIC = 253;
 
 #ifndef MAX_SRV6_SEGMENTS
-    // This allows to define the value during compiationa and change the default
     #define MAX_SRV6_SEGMENTS 10
+#endif
+
+#ifndef IPV6_EXTENSION_HEADER_SIZE
+    #define IPV6_EXTENSION_HEADER_SIZE 8
 #endif
 
 /*************************************************************************
@@ -54,15 +57,18 @@ header ipv6_t {
 header ipv6_ext_base_t {
     bit<8> nextHeader;
     bit<8> hdrExtLen;
+    varbit<16320> data; // Maximum size is 255 octets => 8 * 255 = 2040 bytes = 16'320bits
 }
 
 // Routing extension header
 header route_base_t {
     bit<8>  nextHeader;
-    bit<8>  headerLength;    // Length in 8-octet units, minus first 8 octets
+    bit<8>  headerLength;   // Length in 8-octet units, minus first 8 octets
     bit<8>  routingType;
-    bit<8>  segmentsLeft; // Index (0..N-1) of the next segment to process
-    bit<32> reserved; // Unsure
+    bit<8>  segmentsLeft;   // Index (0..N-1) of the next segment to process
+    bit<8>   last_entry;
+    bit<8>   flags;
+    bit<16>  tag;
 }
 
 header route_segment_list_entry_t {
@@ -87,6 +93,7 @@ header epicl1_per_hop_t {
 
 // Metadata
 struct metadata {
+    bit<4> ext_idx;
 }
 
 // Headers
@@ -96,11 +103,14 @@ struct headers {
 
     // IPv6 headers
     ipv6_t ipv6;
-    ipv6_ext_base_t ipv6_ext_base;
+
+    // IPv6 extensions
+    ipv6_ext_base_t[IPV6_EXTENSION_HEADER_SIZE] ipv6_ext_base_before_SR;
+    ipv6_ext_base_t[IPV6_EXTENSION_HEADER_SIZE] ipv6_ext_base_after_SR;
 
     // Route headers
     route_base_t route_header;
-    route_segment_list_entry_t segment_list[MAX_SRV6_SEGMENTS];
+    route_segment_list_entry_t[MAX_SRV6_SEGMENTS] segment_list;
 
     // EPIC headers
     epicl1_t epic;
@@ -133,40 +143,86 @@ parser MyParser(packet_in packet,
         transition select(hdr.ipv6.nextHeader){
             IPV6_ROUTE: parse_route;
             EPIC: parse_epic;
-            default: parse_ipv6_ext_chain;
+            default: parse_ipv6_ext_chain_before_SR;
         }
     }
 
     state parse_route {
         packet.extract(hdr.route_header);
-        packet.extract(hdr.segment_list, (bit<32>) (hdr.route_header.headerLength / 2))
 
-        transition select(hdr.route_header.nextHeader){
-            EPIC: parse_epic;
-            default: parse_ipv6_ext_chain;
+        // TODO: Do the math for handling the number of segments in the header 
+        transition select((hdr.route_header.headerLength / 128) > MAX_SRV6_SEGMENTS) {
+            true: reject;
+            false: parse_route_list;
         }
     }
 
-    state parse_ipv6_ext_chain {
-        packet.extract(hdr.ipv6_ext_base);
+    state parse_route_list {
+        packet.extract(hdr.segment_list, (bit<32>) (hdr.route_header.headerLength / 2));
 
-        // Calculate length to skip (8 * (hdrExtLen + 1))
-        bit<16> len = (bit<16>) (hdr.ipv6_ext_base.hdrExtLen + 1) * 8;
-        packet.advance((bit<32>) (len - 2)); // already extracted 2 bytes
+        meta.ext_idx = 0;
 
-        transition select(hdr.ipv6_ext_base.nextHeader) {
+        transition select(hdr.route_header.nextHeader){
+            EPIC: parse_epic;
+            default: parse_ipv6_ext_chain_after_SR;
+        }
+    }
 
-            // If any other ipv6 extension header, keep parsing
-            HOPOPT: parse_ipv6_ext_chain;
-            IPV6_ROUTE: parse_ipv6_ext_chain;
-            IPV6_FRAG: parse_ipv6_ext_chain;
-            ESP: parse_ipv6_ext_chain;
-            AH: parse_ipv6_ext_chain;
-            IPV6_OPTS: parse_ipv6_ext_chain;
-            MOBILITY_HEADER: parse_ipv6_ext_chain;
-            HIP: parse_ipv6_ext_chain;
-            SHIM6: parse_ipv6_ext_chain;
-            BIT_EMU: parse_ipv6_ext_chain;
+    state parse_ipv6_ext_chain_before_SR {
+        ipv6_ext_base_t temp;
+        packet.extract(temp, 16);
+
+        // Extract variable size                                          Removing the 2 bytes already extracted
+        bit<32> len = ((bit<32>) (temp.hdrExtLen + 1) * 8) - 2;
+        packet.extract(temp, len * 8);
+
+        hdr.ipv6_ext_base_before_SR[meta.ext_idx] = temp;
+        hdr.ipv6_ext_base_before_SR[meta.ext_idx].setValid();
+
+        meta.ext_idx = meta.ext_idx + 1;
+
+        transition select(temp.nextHeader) {
+            HOPOPT: parse_ipv6_ext_chain_before_SR;
+            IPV6_ROUTE: parse_route;
+            IPV6_FRAG: parse_ipv6_ext_chain_before_SR;
+            ESP: parse_ipv6_ext_chain_before_SR;
+            AH: parse_ipv6_ext_chain_before_SR;
+            IPV6_OPTS: parse_ipv6_ext_chain_before_SR;
+            MOBILITY_HEADER: parse_ipv6_ext_chain_before_SR;
+            HIP: parse_ipv6_ext_chain_before_SR;
+            SHIM6: parse_ipv6_ext_chain_before_SR;
+            BIT_EMU: parse_ipv6_ext_chain_before_SR;
+
+            // parse epic
+            EPIC: parse_epic;
+
+            default: accept;
+        }
+    }
+
+    state parse_ipv6_ext_chain_after_SR {
+        ipv6_ext_base_t temp;
+        packet.extract(temp, 16);
+
+        // Extract variable size                                          Removing the 2 bytes already extracted
+        bit<32> len = ((bit<32>) (temp.hdrExtLen + 1) * 8) - 2;
+        packet.extract(temp, len * 8);
+
+        hdr.ipv6_ext_base_after_SR[meta.ext_idx] = temp;
+        hdr.ipv6_ext_base_after_SR[meta.ext_idx].setValid();
+
+        meta.ext_idx = meta.ext_idx + 1;
+
+        transition select(temp.nextHeader) {
+            HOPOPT: parse_ipv6_ext_chain_after_SR;
+            IPV6_FRAG: parse_ipv6_ext_chain_after_SR;
+            ESP: parse_ipv6_ext_chain_after_SR;
+            AH: parse_ipv6_ext_chain_after_SR;
+            IPV6_OPTS: parse_ipv6_ext_chain_after_SR;
+            MOBILITY_HEADER: parse_ipv6_ext_chain_after_SR;
+            HIP: parse_ipv6_ext_chain_after_SR;
+            SHIM6: parse_ipv6_ext_chain_after_SR;
+            BIT_EMU: parse_ipv6_ext_chain_after_SR;
 
             // parse epic
             EPIC: parse_epic;
@@ -178,13 +234,20 @@ parser MyParser(packet_in packet,
     state parse_epic {
         packet.extract(hdr.epic);
         transition parse_first_epic_hop;
+
+        /* I don't think this is necessary
+        transition select(hdr.epic.per_hop_count){
+            0: reject;
+            default: parse_first_epic_hop;
+        }*/
     }
 
     state parse_first_epic_hop {
         packet.extract(hdr.epic_per_hop_1);
-        transition select(hdr.epic.per_hop_count > 1){
-            true: parse_second_epic_hop;
-            false: accept;
+        transition select(hdr.epic.per_hop_count){
+            0: reject;
+            1: accept;
+            default: parse_second_epic_hop; // hop_count > 1
         }
     }
 
@@ -232,7 +295,7 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
     }
 
     action epic_later_header() {
-        hdr.ipv6_ext_base.nextHeader = hdr.epic.nextHeader;
+        hdr.ipv6_ext_base_after_SR[meta.ext_idx].nextHeader = hdr.epic.nextHeader;
         hdr.epic.setInvalid();
         hdr.epic_per_hop_1.setInvalid();
     }
@@ -312,8 +375,8 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
     apply {
         // Packet forwarding
         if(hdr.ipv6.isValid()) {
-            if(hdr.route_header.isValid() && hdr.segment_list.isValid() && hdr.route_header.segmentsLeft > 0) {
-                routing_forwarding.apply()
+            if(hdr.route_header.isValid() && hdr.route_header.segmentsLeft > 0) {
+                routing_forwarding.apply();
             }
 
             ipv6_forwarding.apply();
@@ -343,21 +406,6 @@ control MyEgress(inout headers hdr,
 /*************************************************************************/
 control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
      apply {
-        update_checksum(
-            hdr.ipv4.isValid(),
-            { hdr.ipv4.version,
-              hdr.ipv4.ihl,
-              hdr.ipv4.diffserv,
-              hdr.ipv4.totalLen,
-              hdr.ipv4.identification,
-              hdr.ipv4.flags,
-              hdr.ipv4.fragOffset,
-              hdr.ipv4.ttl,
-              hdr.ipv4.protocol,
-              hdr.ipv4.srcAddr,
-              hdr.ipv4.dstAddr },
-            hdr.ipv4.hdrChecksum,
-            HashAlgorithm.csum16);
     }
 }
 
@@ -370,12 +418,15 @@ control MyDeparser(packet_out packet, in headers hdr) {
         packet.emit(hdr.ethernet);
         packet.emit(hdr.ipv6);
 
+        // IPv6 extension headers
+        packet.emit(hdr.ipv6_ext_base_before_SR);
+
         // Route header
         packet.emit(hdr.route_header);
         packet.emit(hdr.segment_list);
 
-        // TODO
-        packet.emit(hdr.ipv6_ext_base); // How many times should I emit this? How can I handle multiple?
+        // IPv6 extension headers
+        packet.emit(hdr.ipv6_ext_base_after_SR);
 
         packet.emit(hdr.epic);
         // epic_per_hop_1 shoduln't be emitted since it's valid only for this border router

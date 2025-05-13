@@ -377,11 +377,11 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
     apply {
         // Packet forwarding
         if(hdr.ipv6.isValid()) {
+            ipv6_forwarding.apply();
+
             if(hdr.route_header.isValid() && hdr.route_header.segmentsLeft > 0) {
                 routing_forwarding.apply();
             }
-
-            ipv6_forwarding.apply();
         }
 
 

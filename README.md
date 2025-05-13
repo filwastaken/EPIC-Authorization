@@ -1,5 +1,5 @@
 # EPIC-Authorization
-Implementation of Authorization for source routing based on EPIC algorithms
+Implementation of Authorization for source routing based on EPIC algorithm
 
 ## IPv6 extensions:
 The supported IPv6 extension are the following:
@@ -208,4 +208,88 @@ action nextDestination() {
 }
 ```
 This action will get the next address from the segments and swap it with the destination of the IPv6 header. Consider that the destination port will still sent the packet towards the destination before the swap since the ipv6 forwarding applies before the routing action. The routing apply block is the following:
+
+```p4
+apply {
+    // Packet forwarding
+    if(hdr.ipv6.isValid()) {
+        ipv6_forwarding.apply();
+
+        if(hdr.route_header.isValid() && hdr.route_header.segmentsLeft > 0) {
+            routing_forwarding.apply();
+        }
+    }
+
+    ...
+}
+```
+As it's possible to see from the apply block, the routing forwarding table is applied only if the routing header is valid and there are more segments left.
+
+### Routing extensions deparsing
+The deparsing is quite simple as it just needs to emit the route header and the segment list:
+
+```p4
+// Route header
+packet.emit(hdr.route_header);
+packet.emit(hdr.segment_list);
+```
+
+## EPIC extension:
+TODO: Mention L1 and how it works and why
+
+Then how to do it
+
+
+The EPIC headers are defined as follows:
+```p4
+const bit<8> EPIC = 253;
+
+...
+
+// EPIC Header
+header epicl1_t {
+    bit<32> path_ts;
+    bit<64> src_as_host;
+    bit<64> packet_ts;
+
+    bit<8> per_hop_count;       // Used to loop (with recursion) over the hop validations 
+    bit<8> nextHeader;          // Added nextHeader to the paper implementation
+    // destination validation is unused in l1
+}
+
+header epicl1_per_hop_t {
+    bit<24> hop_validation;
+    bit<16> segment_id;
+}
+```
+
+### Parsing EPIC
+EPIC is parsed as the last IPv6 extension header as the following:
+```p4
+    state parse_epic {
+        packet.extract(hdr.epic);
+        transition parse_first_epic_hop;
+
+        /* I don't think this is necessary
+        transition select(hdr.epic.per_hop_count){
+            0: reject;
+            default: parse_first_epic_hop;
+        }*/
+    }
+
+    state parse_first_epic_hop {
+        packet.extract(hdr.epic_per_hop_1);
+        transition select(hdr.epic.per_hop_count){
+            0: reject;
+            1: accept;
+            default: parse_second_epic_hop; // hop_count > 1
+        }
+    }
+
+    state parse_second_epic_hop {
+        packet.extract(hdr.epic_per_hop_2);
+        transition accept;
+    }
+```
+
 

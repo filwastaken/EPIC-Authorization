@@ -20,6 +20,11 @@ const bit<8> SHIM6 = 140;
 const bit<8> BIT_EMU = 147;
 const bit<8> EPIC = 253;
 
+// Layer 4 definitions
+const bit<8> TYPE_ICMP = 1;
+const bit<8> TYPE_UDP = 17;
+const bit<8> TYPE_TCP = 6;
+
 #ifndef MAX_SRV6_SEGMENTS
     #define MAX_SRV6_SEGMENTS 10
 #endif
@@ -91,10 +96,39 @@ header epicl1_per_hop_t {
     bit<16> segment_id;
 }
 
+// Layer 4 headers
+header tcp_t {
+    bit<16> srcPort;
+    bit<16> dstPort;
+    bit<32> sequenceNum;
+    bit<32> ackNum;
+    bit<4> dataOffset;
+    bit<3> reserved;
+    bit<9> flags;
+    bit<16> winSize;
+    bit<16> checksum;
+    bit<16> urgentPointer;
+}
+
+header udp_t {
+    bit<16> srcPort;
+    bit<16> dstPort;
+    bit<16> len;
+    bit<16> checksum;
+}
+
+header icmp_t {
+    bit<8> type;
+    bit<8> code;
+    bit<16> checksum;
+    bit<32> body;
+}
+
 // Metadata
 struct metadata {
     bit<4> ext_idx;
-    bit<4> segment_list_count;
+    bit<8> segment_list_count;
+    bit<24> calculated_mac;
 }
 
 // Headers
@@ -117,6 +151,12 @@ struct headers {
     epicl1_t epic;
     epicl1_per_hop_t epic_per_hop_1;
     epicl1_per_hop_t epic_per_hop_2;
+
+    // Layer 4 headers
+    udp_t udp;
+    tcp_t tcp;
+    icmp_t icmp;
+
 }
 
 /*************************************************************************/
@@ -161,7 +201,7 @@ parser MyParser(packet_in packet,
     state parse_route_list {
         packet.extract(hdr.segment_list, (bit<32>) (hdr.route_header.headerLength / 2));
 
-        meta.segment_list_count = hdr.segment_list.lastIndex() + 1;
+        meta.segment_list_count = hdr.segment_list.lastIndex + 1;
         meta.ext_idx = 0;
 
         transition select(hdr.route_header.nextHeader){
@@ -247,14 +287,37 @@ parser MyParser(packet_in packet,
     state parse_first_epic_hop {
         packet.extract(hdr.epic_per_hop_1);
         transition select(hdr.epic.per_hop_count){
-            0: reject;
-            1: accept;
+            0: reject; // It doesn't make sense! As long as the epic header is valid, there must be an per_hop header
+            1: layer_4_transition;
             default: parse_second_epic_hop; // hop_count > 1
         }
     }
 
     state parse_second_epic_hop {
         packet.extract(hdr.epic_per_hop_2);
+        transition accept;
+    }
+
+    state layer_4_transition {
+        transition select(hdr.epic.nextHeader) {
+            TYPE_ICMP: parse_icmp;
+            TYPE_UDP: parse_udp;
+            TYPE_TCP: parse_tcp;
+        }
+    }
+
+    state parse_udp {
+        packet.extract(hdr.udp);
+        transition accept;
+    }
+
+    state parse_tcp {
+        packet.extract(hdr.tcp);
+        transition accept;
+    }
+
+    state parse_icmp {
+        packet.extract(hdr.icmp);
         transition accept;
     }
 }
@@ -291,28 +354,6 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         hdr.route_header.segmentsLeft = hdr.route_header.segmentsLeft - 1;
     }
 
-    // EPIC function idea, still to implement
-    action epic_hop() {
-        hdr.epic.per_hop_count = hdr.epic.per_hop_count - 1;
-    }
-
-    action epic_later_header() {
-        hdr.ipv6_ext_base_after_SR[meta.ext_idx].nextHeader = hdr.epic.nextHeader;
-        hdr.epic.setInvalid();
-        hdr.epic_per_hop_1.setInvalid();
-    }
-
-    action epic_first_header() {
-        hdr.ipv6.nextHeader = hdr.epic.nextHeader;
-        hdr.epic.setInvalid();
-        hdr.epic_per_hop_1.setInvalid();
-    }
-
-    action check_hop_validation(){
-        // TODO:
-        // Calculate the MAC and check whether it is correct with the one provided in the header
-    }
-
     // IPv6 table
     table ipv6_forwarding {
         key = {
@@ -345,11 +386,11 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
     // EPIC tables
     table epic_authorization {
         key = {
-            // TODO, based on extern function available
+            meta.calculated_mac: exact;
         }
 
         actions = {
-            check_hop_validation;
+            NoAction;
             drop;
         }
 
@@ -357,37 +398,44 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         default_action = drop();
     }
 
-    table epic_structure {
-        key = {
-            hdr.epic.per_hop_count: exact;
-            hdr.ipv6.nextHeader: exact;
-        }
-
-        actions = {
-            epic_hop;
-            epic_later_header;
-            epic_first_header;
-            drop;
-        }
-
-        size = 1024;
-        default_action = epic_hop();
-    }
-
     apply {
         // Packet forwarding
         if(hdr.ipv6.isValid()) {
+            ipv6_forwarding.apply();
+
+
             if(hdr.route_header.isValid() && hdr.route_header.segmentsLeft > 0) {
                 routing_forwarding.apply();
             }
-
-            ipv6_forwarding.apply();
         }
 
-
         if(hdr.epic.isValid()) {
+            // TODO: Implement this correctly via the extern function
+            // meta.calculated_mac = calculate_mac(parameters)
+
             epic_authorization.apply();
-            epic_structure.apply();
+
+            /*
+             * Modifying the epic header to save on space
+             */
+
+            // Once it's been authorized, the first per-hop header can be removed
+            hdr.epic_per_hop_1.setInvalid();
+
+            // This was the last 
+            if(hdr.epic.per_hop_count > 1) {
+                hdr.epic.per_hop_count = hdr.epic.per_hop_count - 1;
+            } else {
+                if(hdr.ipv6.nextHeader == EPIC) {
+                    hdr.ipv6.nextHeader = hdr.epic.nextHeader;
+                } else if(meta.ext_idx == 0){
+                    hdr.route_header.nextHeader = hdr.epic.nextHeader;
+                } else {
+                    hdr.ipv6_ext_base_after_SR[meta.ext_idx].nextHeader = hdr.epic.nextHeader;
+                }
+
+                hdr.epic.setInvalid();
+            }
         }
     }
 }
@@ -430,9 +478,21 @@ control MyDeparser(packet_out packet, in headers hdr) {
         // IPv6 extension headers
         packet.emit(hdr.ipv6_ext_base_after_SR);
 
+        /*
+         * The epic packet and the epic_per_hop_2 packet are emitted only if they are valid, meaning that this isn't the last
+         * border router inter-AS the packet is passing through. Otherwise they will not be emitted.
+         * The `epic_per_hop_1` header is never emitted since, once it's used, it will never be used by the following routers and
+         * not emitting it will save space/time, especially for fast connections.
+         *
+        */
+
         packet.emit(hdr.epic);
-        // epic_per_hop_1 shoduln't be emitted since it's valid only for this border router
         packet.emit(hdr.epic_per_hop_2);
+
+        // Emit layer 4
+        packet.emit(hdr.icmp); // "4"
+        packet.emit(hdr.udp);
+        packet.emit(hdr.tcp);
     }
 }
 

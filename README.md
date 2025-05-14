@@ -1,5 +1,25 @@
 # EPIC-Authorization
-Implementation of Authorization for source routing based on EPIC algorithms
+This repository aims to implement the algorithms presented in *EPIC: Every Packet Is Checked in the Data Plane of a Path-Aware Internet*, a paper written by Markus Legner, Tobias Klenze, Marc Wyss, Christoph Sprenger, and Adrian Perrig, ETH Zurich that aims to increase security in the **data plane**. In particular, I will focus on ***L1: Improved Path Authorization***. This specification differs from the first implementation of *Path Authorization*, by replacing the *static hop authenticators* that were used in L0 with ***per-packet HVFs*** that will be computed with an *hop authenticator*. During path exploration, the AS calculates its hop authenticator $\sigma_{A}$ as follows:
+
+
+$$
+\sigma_{A}^{(1)} = MAC_{k_{A}} (\text{TSpath} \| \text{HI}_{A} \| S^{{(1)}^{\backprime}} )
+$$
+
+$ S^{{(1)}^{\backprime}} $ is the segment identifier of the previous hop during path exploration, which is obtained by truncating the hop authenticator as follows:
+
+$$
+S(1) = \sigma^{(1)} [ 0 : l_{\text{seg}}]
+$$
+
+The hop authenticator is then used by the source host to calculate the per-packet HVFs like so:
+
+$$
+V_{i}^{(1)} = MAC_{\sigma_{i}^(1)} (\test{ts}_{\test{pkt}} \| \text{SRC} ) [ 0 : l_{\text{val}}]
+$$
+
+
+As the hop authenticators are not part of the packet header to limit communication overhead, the additional segment identifiers are required for chaining hops as they allow ASes to derive the hop authenticators on the fly. The aim of EPIC L1 is improving path authorization; in fact the field $V_{SD}$ is not used. An attacker trying to forge an authorized path needs to find at least one HVF by sending a large number of **probing packets**. In contrast to L0 however, this HVF cannot be used to send additional packets, which carry different timestamps. However, an attacker could still launch a DoS attack by replaying packets or resuing the packet timestamp. The other algorithms shown in the paper, such as L2 and forward, employ a *replay-suppression* algorithm in border routers to prevent this security risk. In particular, ***authentication*** is implemented in the following algorithms, which is not the scope of this repository. This is the reason why I've chosen to implement L1, the most secure algorithm that handles authentication.
 
 ## IPv6 extensions:
 The supported IPv6 extension are the following:
@@ -207,5 +227,267 @@ action nextDestination() {
   hdr.route_header.segmentsLeft = hdr.route_header.segmentsLeft - 1;
 }
 ```
-This action will get the next address from the segments and swap it with the destination of the IPv6 header. Consider that the destination port will still sent the packet towards the destination before the swap since the ipv6 forwarding applies before the routing action. The routing apply block is the following:
+This action will get the next address from the segments and swap it with the destination of the IPv6 header. Consider that the destination port will still sent the packet towards the destination before the swap since the ipv6 forwarding applies before the routing action. The apply block that triggers the table for the routing header is the following:
+```p4
+apply {
+  // Packet forwarding
+  if(hdr.ipv6.isValid()) {
+    ipv6_forwarding.apply();
 
+
+    if(hdr.route_header.isValid() && hdr.route_header.segmentsLeft > 0) {
+      routing_forwarding.apply();
+    }
+  }
+
+  ...
+}
+```
+
+where the IPv6 forwarding table is applied to assign the correct output port to the packet, then the route header is applied if and only if the header is valid and there are segments left to re-route the packet to. This last check is done to speed up the match-action processing of a packet. By checking here if there are segments left instead of in the action, the switch will completly skip the match, therefore saving some clock cycles, which are very important in packet processing considering how fast they need to be handled and forwarded for high speed connections.
+
+### Routing deparser
+There is not much to discuss about the deparser, which is the following:
+```p4
+// Route header
+packet.emit(hdr.route_header);
+packet.emit(hdr.segment_list);
+```
+
+first, the static part of the header is emitted, then the header stack is emitted just as the IPv6 extensions header stacks.
+
+## EPIC header
+The EPIC header is defined as the following:
+
+```p4
+// EPIC Header
+header epicl1_t {
+    bit<32> path_ts;
+    bit<64> src_as_host;
+    bit<64> packet_ts;
+
+    bit<8> per_hop_count;       // Used to loop (with recursion) over the hop validations 
+    bit<8> nextHeader;          // Added nextHeader to the paper implementation
+    // destination validation is unused in l1
+}
+
+header epicl1_per_hop_t {
+    bit<24> hop_validation;
+    bit<16> segment_id;
+}
+```
+
+where I've separated the portion that is found only once in the packet, `epicl1_t`, with the information that is present as many times as the ASes the packet will traverse, `epicl1_per_hop_t`. Differently from the paper, I've added the `nextHeader` value in `epicl1_t`, which is needed to allow this techonology to integrate as an IPv6 extension header.
+
+### EPIC header parsing
+I have defined three headers related to EPIC that will be populated during parsing. They are:
+
+```p4
+epicl1_t epic;
+epicl1_per_hop_t epic_per_hop_1;
+epicl1_per_hop_t epic_per_hop_2;
+```
+
+Furthermore, the states used related to EPIC are the following:
+
+```p4
+state parse_epic {
+  packet.extract(hdr.epic);
+  transition parse_first_epic_hop;
+
+  /* I don't think this is necessary
+  transition select(hdr.epic.per_hop_count){
+    0: reject; // It doesn't make sense! As long as the epic header is valid, there must be an per_hop header
+    default: parse_first_epic_hop;
+  }*/
+  }
+
+state parse_first_epic_hop {
+  packet.extract(hdr.epic_per_hop_1);
+  transition select(hdr.epic.per_hop_count){
+    1: layer_4_transition;
+    default: parse_second_epic_hop; // hop_count > 1
+  }
+}
+
+state parse_second_epic_hop {
+  packet.extract(hdr.epic_per_hop_2);
+  transition accept;
+}
+```
+
+Even though the first epic per-hop information is used by the switch for authorization, the second one is parsed since it's necessary for the deparsing of the packet. I will explain better how and why in the deparsing section.
+
+### EPIC header processing
+At the end of the apply section, if the epic header is valid, the `epic_authorization` table is applied.
+```p4
+apply {
+  ...
+
+  if(hdr.epic.isValid()) {
+    // TODO: Implement this correctly via the extern function
+    // meta.calculated_mac = calculate_mac(parameters)
+
+    epic_authorization.apply();
+
+    /*
+     * Modifying the epic header to save on space
+     */
+
+    // Once it's been authorized, the first per-hop header can be removed
+    hdr.epic_per_hop_1.setInvalid();
+
+    // This was the last 
+    if(hdr.epic.per_hop_count > 1) {
+      hdr.epic.per_hop_count = hdr.epic.per_hop_count - 1;
+    } else {
+      if(hdr.ipv6.nextHeader == EPIC) {
+        hdr.ipv6.nextHeader = hdr.epic.nextHeader;
+      } else {
+        hdr.ipv6_ext_base_after_SR[meta.ext_idx].nextHeader = hdr.epic.nextHeader;
+      }
+
+      hdr.epic.setInvalid();
+    }
+  }
+}
+```
+
+The EPIC authorization table is used to check the validity of the passed HVF for this particular packet. In particular, the MAC is calculated via the following extern function:
+
+```C
+\\ NOT DONE YET
+```
+
+which is saved into the metadata value `calculated_mac`, defined as:
+```p4
+bit<24> calculated_mac;
+```
+
+This is then used as the exact key to compare the calculated mac to the one *passed by the control plane*, which will add it inside the defined table with the associated action `NoAction`. This will make every packet that have a correct MAC pass, all the others will be dropped.
+
+```p4
+table epic_authorization {
+  key = {
+      meta.calculated_mac: exact;
+  }
+  actions = {
+      NoAction;
+      drop;
+  }
+  size = 1024;
+  default_action = drop();
+}
+```
+
+Let's now discuss the section that follows in the apply block:
+#### Modifying the epic header to save on space
+The core idea to save on space is that the per-hop information of the epic header is useful only for a single hop, therefore once one of those information is used, it can be discarded since it will never be used again! I will write again that part of the code for better viewing:
+
+```p4
+/*
+* Modifying the epic header to save on space
+*/
+
+// Once it's been authorized, the first per-hop header can be removed
+hdr.epic_per_hop_1.setInvalid();
+
+// This was the last 
+if(hdr.epic.per_hop_count > 1) {
+  hdr.epic.per_hop_count = hdr.epic.per_hop_count - 1;
+} else {
+  if(hdr.ipv6.nextHeader == EPIC) {
+    hdr.ipv6.nextHeader = hdr.epic.nextHeader;
+  } else if(meta.ext_idx == 0) {
+    hdr.route_header.nextHeader = hdr.epic.nextHeader;
+  } else {
+    hdr.ipv6_ext_base_after_SR[meta.ext_idx].nextHeader = hdr.epic.nextHeader;
+  }
+
+  hdr.epic.setInvalid();
+  }
+```
+
+As I was mentioning above, the first action that can be taking is invalidating the first per-hop header, since it has already been used by this border router and can be skipped in the deparser. Since the EPIC header shrinks in since the more the packet moves through ASes, I need to handle the case where the packet has reached the last AS or it's still traveling through. In particular, if it needs to go through more than 1 AS, I need to reduce the per_hop_count information to reflect the first per_hop invalidation. Otherwise, if this is the last, I need to remove the EPIC header extension as well! To do this, I first need to change the last IPv6 extension next header with the one that follows EPIC. At the moment, only UDP, TCP and ICMP have been implemented. To do this change, I need to know which is the header that precedes the EPIC header. Considering the parser I've created, it can either be the IPv6 header, the Routing header extension or the last header extension AFTER the Segment Routing header, since the assumption is that the EPIC header can never be found before the Routing header. After the change is complete, the epic header is set to be invalid. Consider that I never need to set the epic_per_hop_2 header invalid! If the per_hop_count is equals to 1, then the second per_hop was never parsed in the first place.
+
+NOTE: Considering recent changes in the parser and the deparser, I might be able to drop the assumption that EPIC must appear after the Routing header. In case it were true, the parser would require a lot of changes in the IPv6 extension header stacks.
+
+### EPIC header deparser
+The final part of the deparser apply block is the following:
+
+```p4
+/*
+ * The epic packet and the epic_per_hop_2 packet are emitted only if they are valid, meaning that this isn't the last
+ * border router inter-AS the packet is passing through. Otherwise they will not be emitted.
+ * The `epic_per_hop_1` header is never emitted since, once it's used, it will never be used by the following routers and
+ * not emitting it will save space/time, especially for fast connections.
+ *
+*/
+
+packet.emit(hdr.epic);
+packet.emit(hdr.epic_per_hop_2);
+
+// Emit layer 4
+packet.emit(hdr.icmp); // "4"
+packet.emit(hdr.udp);
+packet.emit(hdr.tcp);
+```
+
+I included the layer 4 headers here because they are required for emitting the rest of the packet in case the EPIC header is removed. Consider the following packet structure:
+
+| Packet |
+----------
+| IPv6 header |
+| Hop-by-Hop Options |
+| Routing Header |
+| EPIC Header |
+| TCP |
+
+By default, any part of the packet that is not parsed after the parser has accepted the packet is emitted with the last header emission in the deparser. For example, if I were not to parse the TCP header, then it would still be emitted by deparsing the EPIC Header. This however poses a problem: I need to emit any header that is found after the EPIC Header even when the EPIC Header is removed! For this reason I've selected a few examples of headers and parsed only when the EPIC Header is going to be removed, so I can emit them! Therefore, in normal cases, parsing the secod per_hop header is enough to remove the first, but when there is only one per_hop and the EPIC header needs to be removed altogheter, I need to parse the layer 4 header. This logic is reflected in the parser as the following states:
+
+```p4
+state parse_first_epic_hop {
+
+  transition select(hdr.epic.per_hop_count){
+    ...
+
+    1: layer_4_transition;
+    
+    ...
+  }
+}
+
+state layer_4_transition {
+  transition select(hdr.epic.nextHeader) {
+    TYPE_ICMP: parse_icmp;
+    TYPE_UDP: parse_udp;
+    TYPE_TCP: parse_tcp;
+  }
+}
+
+state parse_udp {
+  packet.extract(hdr.udp);
+  transition accept;
+}
+
+state parse_tcp {
+  packet.extract(hdr.tcp);
+  transition accept;
+}
+
+state parse_icmp {
+  packet.extract(hdr.icmp);
+  transition accept;
+}
+```
+
+I've repeated the `parse_first_epic_hop` state since I wanted to show how there is no way to nest transitions in p4, making the use of the state `layer_4_transition` a necessity!
+
+## Conclusion on the parser
+The final Mealy machine grpah implemented as the parser is the following:
+![Mealy machine graph](./parser.png)
+
+
+# Project Issues
+- Add the parser picture!
+- At the moment is not parsing because the last index in line 204 is a 32 bit value that I need to truncate. This is a minor problem that I can solve later, it's logically correct

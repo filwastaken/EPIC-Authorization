@@ -3,10 +3,10 @@ This repository aims to implement the algorithms presented in *EPIC: Every Packe
 
 
 $$
-\sigma_{A}^{(1)} = MAC_{k_{A}} (\text{TSpath} \| \text{HI}_{A} \| S^{{(1)}^{\backprime}} )
+\sigma\_{A}^{(1)} = MAC\_{k\_{A}} (\text{TSpath} \| \text{HI}\_{A} \| S^{{(1) \backprime}} )
 $$
 
-$ S^{{(1)}^{\backprime}} $ is the segment identifier of the previous hop during path exploration, which is obtained by truncating the hop authenticator as follows:
+$S^{{(1) \backprime}}$ is the segment identifier of the previous hop during path exploration, which is obtained by truncating the hop authenticator as follows:
 
 $$
 S(1) = \sigma^{(1)} [ 0 : l_{\text{seg}}]
@@ -15,7 +15,7 @@ $$
 The hop authenticator is then used by the source host to calculate the per-packet HVFs like so:
 
 $$
-V_{i}^{(1)} = MAC_{\sigma_{i}^(1)} (\test{ts}_{\test{pkt}} \| \text{SRC} ) [ 0 : l_{\text{val}}]
+V\_{i}^{(1)} = MAC_{\sigma\_{i}^{(1)}} (\text{ts}\_{\text{pkt}} \| \text{SRC} ) [ 0 : l\_{\text{val}}]
 $$
 
 
@@ -435,13 +435,13 @@ packet.emit(hdr.tcp);
 
 I included the layer 4 headers here because they are required for emitting the rest of the packet in case the EPIC header is removed. Consider the following packet structure:
 
-| Packet |
-----------
-| IPv6 header |
+|       Packet       |
+| ------------------ |
+|     IPv6 header    |
 | Hop-by-Hop Options |
-| Routing Header |
-| EPIC Header |
-| TCP |
+|   Routing Header   |
+|     EPIC Header    |
+|         TCP        |
 
 By default, any part of the packet that is not parsed after the parser has accepted the packet is emitted with the last header emission in the deparser. For example, if I were not to parse the TCP header, then it would still be emitted by deparsing the EPIC Header. This however poses a problem: I need to emit any header that is found after the EPIC Header even when the EPIC Header is removed! For this reason I've selected a few examples of headers and parsed only when the EPIC Header is going to be removed, so I can emit them! Therefore, in normal cases, parsing the secod per_hop header is enough to remove the first, but when there is only one per_hop and the EPIC header needs to be removed altogheter, I need to parse the layer 4 header. This logic is reflected in the parser as the following states:
 

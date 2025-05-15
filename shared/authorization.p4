@@ -94,6 +94,7 @@ header epicl1_per_hop_t {
 // Metadata
 struct metadata {
     bit<4> ext_idx;
+    bit<4> segment_list_count;
 }
 
 // Headers
@@ -160,6 +161,7 @@ parser MyParser(packet_in packet,
     state parse_route_list {
         packet.extract(hdr.segment_list, (bit<32>) (hdr.route_header.headerLength / 2));
 
+        meta.segment_list_count = hdr.segment_list.lastIndex() + 1;
         meta.ext_idx = 0;
 
         transition select(hdr.route_header.nextHeader){
@@ -284,7 +286,7 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
 
     //******************** Routing header forwarding ***************************//
     action nextDestination() {
-        bit<8> index = MAX_SRV6_SEGMENTS - hdr.route_header.segmentsLeft;
+        bit<8> index = meta.segment_list_count - hdr.route_header.segmentsLeft;
         hdr.ipv6.dstAddr = hdr.segment_list[index].address;
         hdr.route_header.segmentsLeft = hdr.route_header.segmentsLeft - 1;
     }
@@ -375,11 +377,11 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
     apply {
         // Packet forwarding
         if(hdr.ipv6.isValid()) {
+            ipv6_forwarding.apply();
+
             if(hdr.route_header.isValid() && hdr.route_header.segmentsLeft > 0) {
                 routing_forwarding.apply();
             }
-
-            ipv6_forwarding.apply();
         }
 
 

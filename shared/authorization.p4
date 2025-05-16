@@ -303,6 +303,8 @@ parser MyParser(packet_in packet,
             TYPE_ICMP: parse_icmp;
             TYPE_UDP: parse_udp;
             TYPE_TCP: parse_tcp;
+
+            default: accept; // TODO: Find a way to represent and emit other headers after EPIC
         }
     }
 

@@ -20,11 +20,6 @@ const bit<8> SHIM6 = 140;
 const bit<8> BIT_EMU = 147;
 const bit<8> EPIC = 253;
 
-// Layer 4 definitions
-const bit<8> TYPE_ICMP = 1;
-const bit<8> TYPE_UDP = 17;
-const bit<8> TYPE_TCP = 6;
-
 #ifndef MAX_SRV6_SEGMENTS
     #define MAX_SRV6_SEGMENTS 10
 #endif
@@ -96,34 +91,6 @@ header epicl1_per_hop_t {
     bit<16> segment_id;
 }
 
-// Layer 4 headers
-header tcp_t {
-    bit<16> srcPort;
-    bit<16> dstPort;
-    bit<32> sequenceNum;
-    bit<32> ackNum;
-    bit<4> dataOffset;
-    bit<3> reserved;
-    bit<9> flags;
-    bit<16> winSize;
-    bit<16> checksum;
-    bit<16> urgentPointer;
-}
-
-header udp_t {
-    bit<16> srcPort;
-    bit<16> dstPort;
-    bit<16> len;
-    bit<16> checksum;
-}
-
-header icmp_t {
-    bit<8> type;
-    bit<8> code;
-    bit<16> checksum;
-    bit<32> body;
-}
-
 // Metadata
 struct metadata {
     bit<4> ext_idx;
@@ -151,11 +118,6 @@ struct headers {
     epicl1_t epic;
     epicl1_per_hop_t epic_per_hop_1;
     epicl1_per_hop_t epic_per_hop_2;
-
-    // Layer 4 headers
-    udp_t udp;
-    tcp_t tcp;
-    icmp_t icmp;
 
 }
 
@@ -288,7 +250,7 @@ parser MyParser(packet_in packet,
         packet.extract(hdr.epic_per_hop_1);
         transition select(hdr.epic.per_hop_count){
             0: reject; // It doesn't make sense! As long as the epic header is valid, there must be an per_hop header
-            1: layer_4_transition;
+            1: accept;
             default: parse_second_epic_hop; // hop_count > 1
         }
     }
@@ -298,30 +260,6 @@ parser MyParser(packet_in packet,
         transition accept;
     }
 
-    state layer_4_transition {
-        transition select(hdr.epic.nextHeader) {
-            TYPE_ICMP: parse_icmp;
-            TYPE_UDP: parse_udp;
-            TYPE_TCP: parse_tcp;
-
-            default: accept; // TODO: Find a way to represent and emit other headers after EPIC
-        }
-    }
-
-    state parse_udp {
-        packet.extract(hdr.udp);
-        transition accept;
-    }
-
-    state parse_tcp {
-        packet.extract(hdr.tcp);
-        transition accept;
-    }
-
-    state parse_icmp {
-        packet.extract(hdr.icmp);
-        transition accept;
-    }
 }
 
 /*************************************************************************/
@@ -482,18 +420,13 @@ control MyDeparser(packet_out packet, in headers hdr) {
         /*
          * The epic packet and the epic_per_hop_2 packet are emitted only if they are valid, meaning that this isn't the last
          * border router inter-AS the packet is passing through. Otherwise they will not be emitted.
-         * The `epic_per_hop_1` header is never emitted since, once it's used, it will never be used by the following routers and
+         * The `epic_per_hop_1` header is never emitted since, once it's used, it will never be used by the subsenquent routers and
          * not emitting it will save space/time, especially for fast connections.
          *
         */
 
         packet.emit(hdr.epic);
         packet.emit(hdr.epic_per_hop_2);
-
-        // Emit layer 4
-        packet.emit(hdr.icmp); // "4"
-        packet.emit(hdr.udp);
-        packet.emit(hdr.tcp);
     }
 }
 

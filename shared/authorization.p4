@@ -235,21 +235,16 @@ parser MyParser(packet_in packet,
 
     state parse_epic {
         packet.extract(hdr.epic);
-        transition parse_first_epic_hop;
 
-        /* I don't think this is necessary
         transition select(hdr.epic.per_hop_count){
-            0: reject;
-            default: parse_first_epic_hop;
-        }*/
+            0: reject; // Checks the validity of the EPIC header
+            default: parse_epic_hop;
+        }
     }
 
-    state parse_first_epic_hop {
+    state parse_epic_hop {
         packet.extract(hdr.epic_per_hop);
-        transition select(hdr.epic.per_hop_count){
-            0: reject; // It doesn't make sense! As long as the epic header is valid, there must be an per_hop header
-            default: accept;
-        }
+        transition accept;
     }
 }
 

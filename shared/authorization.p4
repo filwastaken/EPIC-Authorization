@@ -116,9 +116,7 @@ struct headers {
 
     // EPIC headers
     epicl1_t epic;
-    epicl1_per_hop_t epic_per_hop_1;
-    epicl1_per_hop_t epic_per_hop_2;
-
+    epicl1_per_hop_t epic_per_hop;
 }
 
 /*************************************************************************/
@@ -247,19 +245,12 @@ parser MyParser(packet_in packet,
     }
 
     state parse_first_epic_hop {
-        packet.extract(hdr.epic_per_hop_1);
+        packet.extract(hdr.epic_per_hop);
         transition select(hdr.epic.per_hop_count){
             0: reject; // It doesn't make sense! As long as the epic header is valid, there must be an per_hop header
-            1: accept;
-            default: parse_second_epic_hop; // hop_count > 1
+            default: accept;
         }
     }
-
-    state parse_second_epic_hop {
-        packet.extract(hdr.epic_per_hop_2);
-        transition accept;
-    }
-
 }
 
 /*************************************************************************/
@@ -359,7 +350,7 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
              */
 
             // Once it's been authorized, the first per-hop header can be removed
-            hdr.epic_per_hop_1.setInvalid();
+            hdr.epic_per_hop.setInvalid();
 
             // This was the last 
             if(hdr.epic.per_hop_count > 1) {
@@ -418,15 +409,10 @@ control MyDeparser(packet_out packet, in headers hdr) {
         packet.emit(hdr.ipv6_ext_base_after_SR);
 
         /*
-         * The epic packet and the epic_per_hop_2 packet are emitted only if they are valid, meaning that this isn't the last
-         * border router inter-AS the packet is passing through. Otherwise they will not be emitted.
-         * The `epic_per_hop_1` header is never emitted since, once it's used, it will never be used by the subsenquent routers and
+         * The `epic_per_hop` header is never emitted since, once it's used, it will never be used by the subsenquent routers and
          * not emitting it will save space/time, especially for fast connections.
-         *
         */
-
         packet.emit(hdr.epic);
-        packet.emit(hdr.epic_per_hop_2);
     }
 }
 

@@ -309,14 +309,7 @@ state parse_first_epic_hop {
     default: parse_second_epic_hop; // hop_count > 1
   }
 }
-
-state parse_second_epic_hop {
-  packet.extract(hdr.epic_per_hop_2);
-  transition accept;
-}
 ```
-
-Even though the first epic per-hop information is used by the switch for authorization, the second one is parsed since it's necessary for the deparsing of the packet. I will explain better how and why in the deparsing section.
 
 ### EPIC header processing
 At the end of the apply section, if the epic header is valid, the `epic_authorization` table is applied.
@@ -335,7 +328,7 @@ apply {
      */
 
     // Once it's been authorized, the first per-hop header can be removed
-    hdr.epic_per_hop_1.setInvalid();
+    hdr.epic_per_hop.setInvalid();
 
     // This was the last 
     if(hdr.epic.per_hop_count > 1) {
@@ -390,7 +383,7 @@ The core idea to save on space is that the per-hop information of the epic heade
 */
 
 // Once it's been authorized, the first per-hop header can be removed
-hdr.epic_per_hop_1.setInvalid();
+hdr.epic_per_hop.setInvalid();
 
 // This was the last 
 if(hdr.epic.per_hop_count > 1) {
@@ -405,83 +398,24 @@ if(hdr.epic.per_hop_count > 1) {
   }
 
   hdr.epic.setInvalid();
-  }
+}
 ```
 
-As I was mentioning above, the first action that can be taking is invalidating the first per-hop header, since it has already been used by this border router and can be skipped in the deparser. Since the EPIC header shrinks in since the more the packet moves through ASes, I need to handle the case where the packet has reached the last AS or it's still traveling through. In particular, if it needs to go through more than 1 AS, I need to reduce the per_hop_count information to reflect the first per_hop invalidation. Otherwise, if this is the last, I need to remove the EPIC header extension as well! To do this, I first need to change the last IPv6 extension next header with the one that follows EPIC. At the moment, only UDP, TCP and ICMP have been implemented. To do this change, I need to know which is the header that precedes the EPIC header. Considering the parser I've created, it can either be the IPv6 header, the Routing header extension or the last header extension AFTER the Segment Routing header, since the assumption is that the EPIC header can never be found before the Routing header. After the change is complete, the epic header is set to be invalid. Consider that I never need to set the epic_per_hop_2 header invalid! If the per_hop_count is equals to 1, then the second per_hop was never parsed in the first place.
+As I was mentioning above, the first action that can be taking is invalidating the first per-hop header, since it has already been used by this border router and can be skipped in the deparser. Since the EPIC header shrinks in since the more the packet moves through ASes, I need to handle the case where the packet has reached the last AS or it's still traveling through. In particular, if it needs to go through more than 1 AS, I need to reduce the per_hop_count information to reflect the first per_hop invalidation. Otherwise, if this is the last, I need to remove the EPIC header extension as well! To do this, I first need to change the last IPv6 extension next header with the one that follows EPIC. To apply this change, I need to know which is the header that precedes the EPIC header. Considering the parser I've created, it can either be the IPv6 header, the Routing header extension or the last header extension AFTER the Segment Routing header, since the assumption is that the EPIC header can never be found before the Routing header. After the change is complete, the epic header is set to be invalid.
 
-NOTE: Considering recent changes in the parser and the deparser, I might be able to drop the assumption that EPIC must appear after the Routing header. In case it were true, the parser would require a lot of changes in the IPv6 extension header stacks.
+NOTE: Considering recent changes in the parser and the deparser, I might be able to drop the assumption that EPIC must appear after the Routing header. In case it were true, the parser would require *some* changes in the IPv6 extension header stacks.
 
 ### EPIC header deparser
 The final part of the deparser apply block is the following:
 
 ```p4
 /*
- * The epic packet and the epic_per_hop_2 packet are emitted only if they are valid, meaning that this isn't the last
- * border router inter-AS the packet is passing through. Otherwise they will not be emitted.
- * The `epic_per_hop_1` header is never emitted since, once it's used, it will never be used by the following routers and
+ * The `epic_per_hop` header is never emitted since, once it's used, it will never be used by the subsenquent routers and
  * not emitting it will save space/time, especially for fast connections.
- *
 */
 
 packet.emit(hdr.epic);
-packet.emit(hdr.epic_per_hop_2);
-
-// Emit layer 4
-packet.emit(hdr.icmp); // "4"
-packet.emit(hdr.udp);
-packet.emit(hdr.tcp);
 ```
-
-I included the layer 4 headers here because they are required for emitting the rest of the packet in case the EPIC header is removed. Consider the following packet structure:
-
-|       Packet       |
-| ------------------ |
-|     IPv6 header    |
-| Hop-by-Hop Options |
-|   Routing Header   |
-|     EPIC Header    |
-|         TCP        |
-
-By default, any part of the packet that is not parsed after the parser has accepted the packet is emitted with the last header emission in the deparser. For example, if I were not to parse the TCP header, then it would still be emitted by deparsing the EPIC Header. This however poses a problem: I need to emit any header that is found after the EPIC Header even when the EPIC Header is removed! For this reason I've selected a few examples of headers and parsed only when the EPIC Header is going to be removed, so I can emit them! Therefore, in normal cases, parsing the secod per_hop header is enough to remove the first, but when there is only one per_hop and the EPIC header needs to be removed altogheter, I need to parse the layer 4 header. This logic is reflected in the parser as the following states:
-
-```p4
-state parse_first_epic_hop {
-
-  transition select(hdr.epic.per_hop_count){
-    ...
-
-    1: layer_4_transition;
-    
-    ...
-  }
-}
-
-state layer_4_transition {
-  transition select(hdr.epic.nextHeader) {
-    TYPE_ICMP: parse_icmp;
-    TYPE_UDP: parse_udp;
-    TYPE_TCP: parse_tcp;
-  }
-}
-
-state parse_udp {
-  packet.extract(hdr.udp);
-  transition accept;
-}
-
-state parse_tcp {
-  packet.extract(hdr.tcp);
-  transition accept;
-}
-
-state parse_icmp {
-  packet.extract(hdr.icmp);
-  transition accept;
-}
-```
-
-I've repeated the `parse_first_epic_hop` state since I wanted to show how there is no way to nest transitions in p4, making the use of the state `layer_4_transition` a necessity!
 
 ## Conclusion on the parser
 The final Mealy machine grpah implemented as the parser is the following:
@@ -489,5 +423,4 @@ The final Mealy machine grpah implemented as the parser is the following:
 
 
 # Project Issues
-- Add the parser picture!
-- At the moment is not parsing because the last index in line 204 is a 32 bit value that I need to truncate. This is a minor problem that I can solve later, it's logically correct
+At the moment is not compiling because the last index in line 204 is a 32 bit value that I need to truncate. This is a minor problem that I can solve later, it (should) be logically correct

@@ -284,30 +284,24 @@ I have defined three headers related to EPIC that will be populated during parsi
 
 ```p4
 epicl1_t epic;
-epicl1_per_hop_t epic_per_hop_1;
-epicl1_per_hop_t epic_per_hop_2;
+epicl1_per_hop_t epic_per_hop;
 ```
 
 Furthermore, the states used related to EPIC are the following:
 
 ```p4
 state parse_epic {
-  packet.extract(hdr.epic);
-  transition parse_first_epic_hop;
+    packet.extract(hdr.epic);
 
-  /* I don't think this is necessary
-  transition select(hdr.epic.per_hop_count){
-    0: reject; // It doesn't make sense! As long as the epic header is valid, there must be an per_hop header
-    default: parse_first_epic_hop;
-  }*/
-  }
+    transition select(hdr.epic.per_hop_count){
+        0: reject; // Checks the validity of the EPIC header
+        default: parse_epic_hop;
+    }
+}
 
-state parse_first_epic_hop {
-  packet.extract(hdr.epic_per_hop_1);
-  transition select(hdr.epic.per_hop_count){
-    1: layer_4_transition;
-    default: parse_second_epic_hop; // hop_count > 1
-  }
+state parse_epic_hop {
+    packet.extract(hdr.epic_per_hop);
+    transition accept;
 }
 ```
 
